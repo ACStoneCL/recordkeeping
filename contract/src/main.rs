@@ -1,60 +1,85 @@
 #![no_std]
 #![no_main]
 
-#[cfg(not(target_arch = "wasm32"))]
-compile_error!("target arch should be wasm32: compile with '--target wasm32-unknown-unknown'");
-
-// We need to explicitly import the std alloc crate and `alloc::string::String` as we're in a
-// `no_std` environment.
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use casper_contract::contract_api::{runtime, storage};
+use casper_types::{Key, PublicKey, URef, U512};
 
-use casper_contract::{
-    contract_api::{runtime, storage},
-    unwrap_or_revert::UnwrapOrRevert,
-};
-use casper_types::{ApiError, Key};
+const WATCHSTANDER_DICT: &str = "watchstander_dict";
+const SUPERVISOR_DICT: &str = "supervisor_dict";
+const ENTRY_DICT: &str = "entry_dict";
 
-const KEY_NAME: &str = "my-key-name";
-const RUNTIME_ARG_NAME: &str = "message";
-
-/// An error enum which can be converted to a `u16` so it can be returned as an `ApiError::User`.
-#[repr(u16)]
-enum Error {
-    KeyAlreadyExists = 0,
-    KeyMismatch = 1,
+#[no_mangle]
+pub extern "C" fn approve_supervisor() {
+    let supervisor_public_key: PublicKey = runtime::get_named_arg("supervisor_public_key");
+    let supervisor_dict: URef = storage::new_dictionary(SUPERVISOR_DICT).unwrap();
+    storage::dictionary_put(supervisor_dict, &supervisor_public_key.to_string(), true);
 }
 
-impl From<Error> for ApiError {
-    fn from(error: Error) -> Self {
-        ApiError::User(error as u16)
+#[no_mangle]
+pub extern "C" fn approve_watchstander() {
+    let supervisor_public_key: PublicKey = runtime::get_named_arg("supervisor_public_key");
+    let watchstander_public_key: PublicKey = runtime::get_named_arg("watchstander_public_key");
+
+    let supervisor_dict: URef = storage::new_dictionary(SUPERVISOR_DICT).unwrap();
+    let is_approved: Option<bool> = storage::dictionary_get(supervisor_dict, &supervisor_public_key.to_string()).unwrap();
+
+    if let Some(true) = is_approved {
+        let watchstander_dict: URef = storage::new_dictionary(WATCHSTANDER_DICT).unwrap();
+        storage::dictionary_put(watchstander_dict, &watchstander_public_key.to_string(), true);
+    } else {
+        runtime::revert(Error::SupervisorNotApproved)
     }
 }
 
 #[no_mangle]
-pub extern "C" fn call() {
-    // The key shouldn't already exist in the named keys.
-    let missing_key = runtime::get_key(KEY_NAME);
-    if missing_key.is_some() {
-        runtime::revert(Error::KeyAlreadyExists);
+pub extern "C" fn make_entry() {
+    let supervisor_public_key: PublicKey = runtime::get_named_arg("supervisor_public_key");
+    let watchstander_public_key: PublicKey = runtime::get_named_arg("watchstander_public_key");
+    let date: String = runtime::get_named_arg("date");
+    let time: String = runtime::get_named_arg("time");
+    let entry: String = runtime::get_named_arg("entry");
+
+    let supervisor_dict: URef = storage::new_dictionary(SUPERVISOR_DICT).unwrap();
+    let is_supervisor_approved: Option<bool> = storage::dictionary_get(supervisor_dict, &supervisor_public_key.to_string()).unwrap();
+
+    let watchstander_dict: URef = storage::new_dictionary(WATCHSTANDER_DICT).unwrap();
+    let is_watchstander_approved: Option<bool> = storage::dictionary_get(watchstander_dict, &watchstander_public_key.to_string()).unwrap();
+
+    if let (Some(true), Some(true)) = (is_supervisor_approved, is_watchstander_approved) {
+        let entry_key = format!("{}-{}", date, time);
+        let entry_dict: URef = storage::new_dictionary(ENTRY_DICT).unwrap();
+        let mut entries: BTreeMap<String, String> = storage::dictionary_get(entry_dict, &date).unwrap_or_default();
+        entries.insert(time, entry);
+        storage::dictionary_put(entry_dict, &date, entries);
+    } else {
+        runtime::revert(Error::NotAuthorized)
     }
+}
 
-    // This contract expects a single runtime argument to be provided.  The arg is named "message"
-    // and will be of type `String`.
-    let value: String = runtime::get_named_arg(RUNTIME_ARG_NAME);
+#[no_mangle]
+pub extern "C" fn retrieve_entries_by_date() {
+    let date: String = runtime::get_named_arg("date");
 
-    // Store this value under a new unforgeable reference a.k.a `URef`.
-    let value_ref = storage::new_uref(value);
+    let entry_dict: URef = storage::new_dictionary(ENTRY_DICT).unwrap();
+    let entries: BTreeMap<String, String> = storage::dictionary_get(entry_dict, &date).unwrap_or_default();
 
-    // Store the new `URef` as a named key with a name of `KEY_NAME`.
-    let key = Key::URef(value_ref);
-    runtime::put_key(KEY_NAME, key);
+    runtime::ret(entries, vec![]);
+}
 
-    // The key should now be able to be retrieved.  Note that if `get_key()` returns `None`, then
-    // `unwrap_or_revert()` will exit the process, returning `ApiError::None`.
-    let retrieved_key = runtime::get_key(KEY_NAME).unwrap_or_revert();
-    if retrieved_key != key {
-        runtime::revert(Error::KeyMismatch);
+#[no_mangle]
+pub extern "C" fn retrieve_entry_by_date_and_time() {
+    let date: String = runtime::get_named_arg("date");
+    let time: String = runtime::get_named_arg("time");
+
+    let entry_dict: URef = storage::new_dictionary(ENTRY_DICT).unwrap();
+    let entries: BTreeMap<String, String> = storage::dictionary_get(entry_dict, &date).unwrap_or_default();
+    let entry = entries.get(&time);
+
+    match entry {
+        Some(entry) => runtime::ret(entry, vec![]),
+        None => runtime::revert(Error::EntryNotFound),
     }
 }
